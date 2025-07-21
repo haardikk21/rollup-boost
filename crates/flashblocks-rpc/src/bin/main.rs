@@ -3,6 +3,7 @@
 use clap::Parser;
 use flashblocks_rpc::{EthApiOverrideServer, FlashblocksApiExt, FlashblocksOverlay};
 use reth_optimism_cli::{Cli, chainspec::OpChainSpecParser};
+use reth_optimism_evm::OpEvmConfig;
 use reth_optimism_node::{OpNode, args::RollupArgs};
 use tracing::info;
 
@@ -30,11 +31,15 @@ fn main() {
                 .node(OpNode::new(rollup_args))
                 .extend_rpc_modules(move |ctx| {
                     if args.flashblocks_enabled {
-                        let mut flashblocks_overlay =
-                            FlashblocksOverlay::new(args.websocket_url, chain_spec);
+                        let eth_api = ctx.registry.eth_api().clone();
+
+                        let mut flashblocks_overlay = FlashblocksOverlay::new(
+                            args.websocket_url,
+                            chain_spec,
+                            eth_api.clone(),
+                        );
                         flashblocks_overlay.start()?;
 
-                        let eth_api = ctx.registry.eth_api().clone();
                         let api_ext = FlashblocksApiExt::new(eth_api.clone(), flashblocks_overlay);
 
                         ctx.modules.replace_configured(api_ext.into_rpc())?;

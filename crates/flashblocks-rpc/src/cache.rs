@@ -1,6 +1,8 @@
-use alloy_consensus::Transaction as _;
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::transaction::TransactionMeta;
+use alloy_consensus::Transaction as _;
+use alloy_evm::revm::database::State;
+use alloy_evm::{Evm, EvmEnv};
 use alloy_primitives::{Address, Sealable, TxHash, U256};
 use alloy_rpc_types::Withdrawals;
 use alloy_rpc_types::{BlockTransactions, Header, TransactionInfo};
@@ -9,19 +11,31 @@ use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::OpTransactionReceipt;
 use op_alloy_rpc_types::Transaction;
+use op_revm::OpSpecId;
+use reth_node_api::ConfigureEvm;
 use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_evm::extract_l1_info;
+use reth_optimism_evm::OpEvmConfig;
+use reth_optimism_evm::OpNextBlockEnvAttributes;
 use reth_optimism_primitives::{OpBlock, OpReceipt, OpTransactionSigned};
 use reth_optimism_rpc::OpReceiptBuilder;
 use reth_primitives::Recovered;
 use reth_primitives_traits::block::body::BlockBody;
 
-use reth_rpc_eth_api::{RpcBlock, RpcReceipt};
+use reth_provider::{HeaderProvider, ProviderError};
+use reth_revm::context::result::ResultAndState;
+use reth_revm::database::StateProviderDatabase;
+use reth_revm::Database;
+use reth_revm::DatabaseCommit;
+use reth_rpc_eth_api::helpers::FullEthApi;
+use reth_rpc_eth_api::{ RpcBlock, RpcNodeCore, RpcReceipt};
 use rollup_boost::{
     FlashblockBuilder, FlashblocksPayloadV1, OpExecutionPayloadEnvelope, PayloadVersion,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, str::FromStr, sync::Arc};
+use alloy_eips::BlockId;
+use tracing::info;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Metadata {
@@ -31,17 +45,29 @@ pub struct Metadata {
 }
 
 #[derive(Clone)]
-pub struct FlashblocksCache {
+pub struct FlashblocksCache<Eth> {
+    chain_spec: Arc<OpChainSpec>,
     inner: Arc<ArcSwap<FlashblocksCacheInner>>,
     // TODO: add arc_swap::Cache to speed it up even more
+    eth_api: Eth,
+    evm_env: Option<EvmEnv<OpSpecId>>,
 }
 
-impl FlashblocksCache {
-    pub fn new(chain_spec: Arc<OpChainSpec>) -> Self {
+impl<Eth> FlashblocksCache<Eth>
+where
+    Eth: FullEthApi<NetworkTypes = Optimism> + Send + Sync + 'static,
+    alloy_consensus::Header: From<alloy_rpc_types_eth::Header<<<Eth as RpcNodeCore>::Provider as HeaderProvider>::Header>>
+
+{
+    pub fn new(chain_spec: Arc<OpChainSpec>, eth_api: Eth) -> Self {
+
         Self {
             inner: Arc::new(ArcSwap::from_pointee(FlashblocksCacheInner::new(
-                chain_spec,
+                chain_spec.clone(),
             ))),
+            chain_spec,
+            eth_api,
+            evm_env: None,
         }
     }
 
@@ -61,9 +87,36 @@ impl FlashblocksCache {
         ArcSwap::load(&self.inner).get_receipt(tx_hash)
     }
 
-    pub fn process_payload(&self, payload: FlashblocksPayloadV1) -> eyre::Result<()> {
+    pub async fn process_payload(&mut self, payload: FlashblocksPayloadV1) -> eyre::Result<()> {
+        if payload.index == 0 {
+            let evm_config = OpEvmConfig::optimism(self.chain_spec.clone());
+            let parent_block = self.eth_api.rpc_block(BlockId::latest(), false).await.expect("parent block first expect").expect("failed to get parent block");
+            let parent_header = parent_block.header.clone();
+            let base = payload.base.clone().unwrap();
+            let block_env_attributes = OpNextBlockEnvAttributes {
+                timestamp: base.timestamp,
+                suggested_fee_recipient: base.fee_recipient,
+                prev_randao: base.prev_randao,
+                gas_limit: base.gas_limit,
+                parent_beacon_block_root: Some(base.parent_beacon_block_root),
+                extra_data: base.extra_data,
+            };
+            let header: alloy_consensus::Header = parent_header.into();
+            let evm_env = evm_config
+                .next_evm_env(&header, &block_env_attributes)
+                .unwrap();
+            self.evm_env = Some(evm_env);
+        }
+
+        let state = self.eth_api.state_at_block_id_or_latest(None).unwrap();
+        let state_db =StateProviderDatabase::new(state);
+        let mut db = State::builder()
+            .with_database(state_db)
+            .with_bundle_update()
+            .build();
+
         let mut new_state = FlashblocksCacheInner::clone(&self.inner.load_full());
-        new_state.process_payload(payload)?;
+        new_state.process_payload(payload, &mut db, self.evm_env.as_ref().unwrap().clone())?;
         self.inner.store(Arc::new(new_state));
         Ok(())
     }
@@ -143,7 +196,18 @@ impl FlashblocksCacheInner {
         self.receipts_cache.clear();
     }
 
-    pub fn process_payload(&mut self, payload: FlashblocksPayloadV1) -> eyre::Result<()> {
+    pub fn process_payload<DB>(
+        &mut self,
+        payload: FlashblocksPayloadV1,
+        db: &mut State<DB>,
+        evm_env: EvmEnv<OpSpecId>,
+    ) -> eyre::Result<()>
+    where
+        DB: Database<Error = ProviderError>,
+    {
+        let evm_config = OpEvmConfig::optimism(self.chain_spec.clone());
+        let mut evm = evm_config.evm_with_env(db, evm_env);
+
         // Convert metadata with error handling
         let metadata: Metadata = match serde_json::from_value(payload.metadata.clone()) {
             Ok(m) => m,
@@ -176,6 +240,23 @@ impl FlashblocksCacheInner {
         // Update the nonce for each transaction
         let mut nonce_map = HashMap::new();
         let mut all_receipts = Vec::new();
+
+        for tx in block.body.transactions.iter() {
+            let recovered_tx = tx.clone().try_into_recovered().unwrap();
+            let ResultAndState { result, state } = match evm.transact(&recovered_tx) {
+                Ok(res) => res,
+                Err(err) => {
+                    return Err(eyre::eyre!("Failed to transact: {}", err));
+                }
+            };
+
+            info!(
+                "commiting txn {:?} to state. result: {:?}",
+                tx.tx_hash(),
+                result
+            );
+            evm.db_mut().commit(state);
+        }
 
         for tx in block.body.transactions.iter() {
             if let Ok(from) = tx.recover_signer() {

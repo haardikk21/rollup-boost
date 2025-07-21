@@ -4,25 +4,29 @@ use futures_util::StreamExt;
 use jsonrpsee::core::async_trait;
 use op_alloy_network::Optimism;
 use reth_optimism_chainspec::OpChainSpec;
-use reth_rpc_eth_api::{RpcBlock, RpcReceipt};
+use reth_rpc_eth_api::{RpcBlock, RpcReceipt, helpers::FullEthApi, RpcNodeCore};
 use rollup_boost::FlashblocksPayloadV1;
 use std::{io::Read, sync::Arc};
+use reth_provider::HeaderProvider;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info};
 use url::Url;
-
 #[derive(Clone)]
-pub struct FlashblocksOverlay {
+pub struct FlashblocksOverlay<Eth> {
     url: Url,
-    cache: FlashblocksCache,
+    cache: FlashblocksCache<Eth>,
 }
 
-impl FlashblocksOverlay {
-    pub fn new(url: Url, chain_spec: Arc<OpChainSpec>) -> Self {
+impl<Eth> FlashblocksOverlay<Eth>
+where
+    Eth: FullEthApi<NetworkTypes = Optimism> + Send + Sync + 'static,
+    alloy_consensus::Header: From<alloy_rpc_types_eth::Header<<<Eth as RpcNodeCore>::Provider as HeaderProvider>::Header>>
+{
+    pub fn new(url: Url, chain_spec: Arc<OpChainSpec>, eth_api: Eth) -> Self {
         Self {
             url,
-            cache: FlashblocksCache::new(chain_spec),
+            cache: FlashblocksCache::new(chain_spec, eth_api),
         }
     }
 
@@ -85,12 +89,12 @@ impl FlashblocksOverlay {
             }
         });
 
-        let cache_cloned = self.cache.clone();
+        let mut cache_cloned = self.cache.clone();
         tokio::spawn(async move {
             while let Some(message) = receiver.recv().await {
                 match message {
                     InternalMessage::NewPayload(payload) => {
-                        if let Err(e) = cache_cloned.process_payload(payload) {
+                        if let Err(e) = cache_cloned.process_payload(payload).await {
                             error!("failed to process payload: {}", e);
                         }
                     }
@@ -101,8 +105,8 @@ impl FlashblocksOverlay {
         Ok(())
     }
 
-    pub fn process_payload(&self, payload: FlashblocksPayloadV1) -> eyre::Result<()> {
-        self.cache.process_payload(payload)
+    pub async fn process_payload(&mut self, payload: FlashblocksPayloadV1) -> eyre::Result<()> {
+        self.cache.process_payload(payload).await
     }
 }
 
@@ -139,7 +143,11 @@ fn try_parse_message(bytes: &[u8]) -> eyre::Result<String> {
 }
 
 #[async_trait]
-impl FlashblocksApi for FlashblocksOverlay {
+impl<Eth> FlashblocksApi for FlashblocksOverlay<Eth>
+where
+    Eth: FullEthApi<NetworkTypes = Optimism> + Send + Sync + 'static,
+    alloy_consensus::Header: From<alloy_rpc_types_eth::Header<<<Eth as RpcNodeCore>::Provider as HeaderProvider>::Header>>
+{
     async fn block_by_number(&self, full: bool) -> Option<RpcBlock<Optimism>> {
         self.cache.get_block(full)
     }

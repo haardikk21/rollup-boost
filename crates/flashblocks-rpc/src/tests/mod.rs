@@ -99,19 +99,19 @@ mod tests {
             .with_components(node.components_builder())
             .with_add_ons(node.add_ons())
             .extend_rpc_modules(move |ctx| {
+                let eth_api = ctx.registry.eth_api().clone();
                 // We are not going to use the websocket connection to send payloads so we use
                 // a dummy url.
-                let flashblocks_overlay =
-                    FlashblocksOverlay::new(Url::parse("ws://localhost:8546")?, chain_spec);
 
-                let eth_api = ctx.registry.eth_api().clone();
+                let mut flashblocks_overlay =
+                    FlashblocksOverlay::new(Url::parse("ws://localhost:8546")?, chain_spec, eth_api.clone());
+
                 let api_ext = FlashblocksApiExt::new(eth_api.clone(), flashblocks_overlay.clone());
-
                 ctx.modules.replace_configured(api_ext.into_rpc())?;
 
                 tokio::spawn(async move {
                     while let Some((payload, tx)) = receiver.recv().await {
-                        flashblocks_overlay.process_payload(payload).unwrap();
+                        flashblocks_overlay.process_payload(payload).await.unwrap();
                         tx.send(()).unwrap();
                     }
                 });

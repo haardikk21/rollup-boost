@@ -96,9 +96,9 @@ where
     ) -> RpcResult<Option<RpcReceipt<Optimism>>> {
         debug!("get_transaction_receipt: {:?}", tx_hash);
 
-        if let Some(fb_receipt) = self.flashblocks_api.get_transaction_receipt(tx_hash).await {
-            return Ok(Some(fb_receipt));
-        }
+        // if let Some(fb_receipt) = self.flashblocks_api.get_transaction_receipt(tx_hash).await {
+        //     return Ok(Some(fb_receipt));
+        // }
 
         EthTransactions::transaction_receipt(&self.eth_api, tx_hash)
             .await
